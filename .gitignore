@@ -45,6 +45,8 @@ pnpm-debug.log*
 *.log
 backend/logs/*.jsonl
 !backend/logs/.gitkeep
+.tools/
+.tmp-public-dev/
 
 # IDEs & System
 .vscode/

@@ -73,11 +73,11 @@ scripts\public-dev.bat
 The script starts:
 - FastAPI on `http://127.0.0.1:8000`
 - Vite on `http://127.0.0.1:5173`
-- a public backend URL like `https://...trycloudflare.com`
 - a public frontend URL like `https://...trycloudflare.com`
 
-It writes the temporary backend tunnel URL to `frontend/.env.public.local` as `VITE_API_URL`,
-so the public frontend calls the public backend instead of `localhost`.
+It uses the notebook-style same-origin proxy pattern: only the frontend is public, and Vite
+proxies `/api` and `/health` to the local FastAPI backend. If `cloudflared` is not on `PATH`,
+the script downloads `cloudflared.exe` into `.tools/` automatically.
 Keep the Command Prompt window open; the public URLs live only while the script and tunnels are running.
 
 ---

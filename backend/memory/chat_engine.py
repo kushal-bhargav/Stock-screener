@@ -11,13 +11,21 @@ from __future__ import annotations
 import json
 import os
 import re
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 from pathlib import Path
 from dotenv import load_dotenv
 
-env_path = Path(__file__).resolve().parent.parent / "config" / ".env"
-load_dotenv(dotenv_path=env_path)
+BACKEND_ROOT = Path(__file__).resolve().parent.parent
+PROJECT_ROOT = BACKEND_ROOT.parent
+
+for env_path in (
+    BACKEND_ROOT / "config" / ".env",
+    BACKEND_ROOT / ".env",
+    PROJECT_ROOT / ".env",
+):
+    if env_path.exists():
+        load_dotenv(dotenv_path=env_path, override=False)
 
 # LangChain Imports (Lesson 8)
 from langchain_core.chat_history import InMemoryChatMessageHistory
@@ -75,6 +83,15 @@ SCORE_BANDS = [
 ]
 
 
+# Keep fallback output ASCII-safe across Windows consoles and the React renderer.
+SCORE_BANDS = [
+    (85, "Excellent"),
+    (70, "Good"),
+    (55, "Average"),
+    (0, "Weak"),
+]
+
+
 def _band(score: int) -> str:
     for threshold, label in SCORE_BANDS:
         if score >= threshold:
@@ -122,6 +139,37 @@ def _piotroski_summary(details: Dict) -> str:
         lines.append(f"  ✅ Passing signals: {', '.join(pass_sigs[:4])}")
     if fail_sigs:
         lines.append(f"  ❌ Weak signals: {', '.join(fail_sigs[:4])}")
+    return "\n".join(lines)
+
+
+def _fmt_dim_scores(scores: Dict[str, int]) -> str:
+    parts = []
+    for dim, label in DIM_LABELS.items():
+        s = scores.get(dim)
+        parts.append(f"  - **{dim} - {label}**: {_fmt_score(s)}")
+    return "\n".join(parts)
+
+
+def _metrics_summary(details: Dict, dim: str) -> str:
+    dim_data = details.get(dim, {})
+    metrics = dim_data.get("metrics", [])
+    if not metrics:
+        return "  No detailed metrics available."
+    return "\n".join(f"  - {m['name']}: {m['value']}" for m in metrics[:8])
+
+
+def _piotroski_summary(details: Dict) -> str:
+    p = (details.get("F") or {}).get("piotroski")
+    if not p:
+        return ""
+    lines = [f"  Piotroski F-Score: **{p['score']}/{p['max_score']}** ({p['pct']}%)"]
+    sigs = p.get("signals", {})
+    pass_sigs = [k for k, v in sigs.items() if v]
+    fail_sigs = [k for k, v in sigs.items() if not v]
+    if pass_sigs:
+        lines.append(f"  - Passing signals: {', '.join(pass_sigs[:4])}")
+    if fail_sigs:
+        lines.append(f"  - Weak signals: {', '.join(fail_sigs[:4])}")
     return "\n".join(lines)
 
 
@@ -216,12 +264,18 @@ class ChatEngine:
         self.buffer = buffer
         self.session_id = session_id or "default_session"
         self._groq_chain = None
+        self._provider = "fallback"
+        self._provider_reason = "GROQ_API_KEY is not configured."
         self._init_groq()
 
     def _init_groq(self):
         """Initialize LangChain ChatGroq chain with RunnableWithMessageHistory (Lesson 8)."""
         groq_api_key = os.getenv("GROQ_API_KEY")
-        if not groq_api_key or not _GROQ_AVAILABLE:
+        if not _GROQ_AVAILABLE:
+            self._provider_reason = "langchain_groq is not installed."
+            return
+        if not groq_api_key:
+            self._provider_reason = "GROQ_API_KEY is not configured."
             return
 
         try:
@@ -254,8 +308,12 @@ class ChatEngine:
                 input_messages_key="input",
                 history_messages_key="history",
             )
-        except Exception:
+            self._provider = "groq_llm"
+            self._provider_reason = f"ChatGroq ready with model {model_name}."
+        except Exception as exc:
             self._groq_chain = None
+            self._provider = "fallback"
+            self._provider_reason = f"ChatGroq initialization failed: {exc}"
 
     def respond(self, user_message: str, session_id: Optional[str] = None) -> Dict[str, Any]:
         """
@@ -283,10 +341,13 @@ class ChatEngine:
                     "reply": reply_text,
                     "suggestions": suggestions,
                     "intent": "groq_llm",
+                    "provider": "groq_llm",
+                    "provider_reason": self._provider_reason,
                     "tickers_in_memory": tickers,
                 }
-            except Exception:
-                pass  # Graceful fallback to deterministic logic
+            except Exception as exc:
+                self._provider = "fallback"
+                self._provider_reason = f"ChatGroq request failed: {exc}"
 
         # Deterministic engine fallback
         intent = _classify(user_message, tickers)
@@ -297,6 +358,8 @@ class ChatEngine:
             "reply": reply,
             "suggestions": suggestions,
             "intent": intent.get("intent"),
+            "provider": self._provider,
+            "provider_reason": self._provider_reason,
             "tickers_in_memory": tickers,
         }
 
@@ -337,7 +400,7 @@ class ChatEngine:
                 return self._ticker_not_found(intent.get("ticker"), tickers)
             return self._reply_dimension(t, dim, ctx[t])
 
-        return self._reply_fallback(raw, tickers)
+        return self._reply_fallback(raw, tickers, ctx)
 
     def _reply_overall(self, ticker: str, data: Dict) -> str:
         name = data.get("name") or ticker
@@ -478,8 +541,58 @@ class ChatEngine:
                     f"Run a scorecard first.\n\nTickers I know: {known}")
         return f"I know about: {known}. Ask me about any of them!"
 
-    def _reply_fallback(self, raw: str, tickers: List[str]) -> str:
+    def _score_leaders(self, scores: Dict[str, int]) -> tuple[Optional[tuple[str, int]], Optional[tuple[str, int]]]:
+        numeric = [
+            (DIM_LABELS.get(dim, dim), score)
+            for dim, score in scores.items()
+            if isinstance(score, int)
+        ]
+        if not numeric:
+            return None, None
+        numeric.sort(key=lambda item: item[1], reverse=True)
+        return numeric[0], numeric[-1]
+
+    def _reply_grounded_fallback(self, ticker: str, data: Dict, raw: str) -> str:
+        name = data.get("name") or ticker
+        overall = data.get("overall_score")
+        scores = data.get("scores", {})
+        strongest, weakest = self._score_leaders(scores)
+
+        lines = [
+            f"I can answer that from the scorecard data I have for **{ticker} ({name})**.",
+            "",
+            f"- Overall score: **{_fmt_score(overall)}**",
+        ]
+
+        if strongest:
+            lines.append(f"- Strongest area: **{strongest[0]}** at **{_fmt_score(strongest[1])}**")
+        if weakest and weakest != strongest:
+            lines.append(f"- Main watch area: **{weakest[0]}** at **{_fmt_score(weakest[1])}**")
+
+        details = data.get("details", {})
+        piotroski = _piotroski_summary(details)
+        if piotroski and re.search(r"\b(financial|quality|risk|why|f-score|piotroski)\b", raw, re.I):
+            lines += ["", "**Financial evidence:**", piotroski]
+
+        momentum = (details.get("M") or {}).get("returns", {})
+        if momentum and re.search(r"\b(momentum|trend|price|move|return)\b", raw, re.I):
+            lines += ["", "**Momentum evidence:**"]
+            for period, val in list(momentum.items())[:4]:
+                direction = "up" if val >= 0 else "down"
+                lines.append(f"- {period}: {direction} {abs(val):.1f}%")
+
+        lines += [
+            "",
+            "For a more conversational answer, configure `GROQ_API_KEY`; otherwise I will stay grounded to the local scorecard fields.",
+        ]
+        return "\n".join(lines)
+
+    def _reply_fallback(self, raw: str, tickers: List[str], ctx: Dict[str, Any]) -> str:
         if tickers:
+            selected = _extract_ticker_from_text(raw, tickers) or self.buffer.last_ticker()
+            if selected and selected in ctx:
+                return self._reply_grounded_fallback(selected, ctx[selected], raw)
+
             known = ", ".join(f"**{t}**" for t in tickers[-5:])
             return (f"I'm not sure what you mean. I have data for {known}.\n\n"
                     "Try asking:\n"

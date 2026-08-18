@@ -59,6 +59,27 @@ npm run dev
 
 UI runs at http://localhost:5173
 
+### Public dev URLs without a token
+
+For temporary public URLs while both local servers are running, use Cloudflare Quick Tunnel.
+This does not require a Cloudflare account or token.
+
+Install `cloudflared` once and make sure it is on `PATH`, then run from the project root:
+
+```bat
+scripts\public-dev.bat
+```
+
+The script starts:
+- FastAPI on `http://127.0.0.1:8000`
+- Vite on `http://127.0.0.1:5173`
+- a public backend URL like `https://...trycloudflare.com`
+- a public frontend URL like `https://...trycloudflare.com`
+
+It writes the temporary backend tunnel URL to `frontend/.env.public.local` as `VITE_API_URL`,
+so the public frontend calls the public backend instead of `localhost`.
+Keep the Command Prompt window open; the public URLs live only while the script and tunnels are running.
+
 ---
 
 ## API

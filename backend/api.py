@@ -131,6 +131,8 @@ async def chat(req: ChatRequest):
         "reply": response["reply"],
         "suggestions": response["suggestions"],
         "intent": response["intent"],
+        "provider": response.get("provider"),
+        "provider_reason": response.get("provider_reason"),
         "tickers_in_memory": response["tickers_in_memory"],
         "history": [
             {
